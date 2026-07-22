@@ -37,11 +37,14 @@ type User struct {
 	UpdatedAt    time.Time  `json:"updatedAt,omitempty" form:"updatedAt,omitempty"`
 }
 
-func (u *User) BeforeSave(tx *gorm.DB) (err error) {
+func (u *User) BeforeSave(_ *gorm.DB) (err error) {
 	p := bluemonday.UGCPolicy()
 
 	val := reflect.ValueOf(u).Elem()
 	for i := 0; i < val.NumField(); i++ {
+		if val.Type().Field(i).Name == "Password" {
+			continue
+		}
 		fieldVal := val.Field(i)
 		if fieldVal.Kind() == reflect.String && fieldVal.CanSet() {
 			rawStr := val.Field(i).String()
@@ -49,20 +52,28 @@ func (u *User) BeforeSave(tx *gorm.DB) (err error) {
 		}
 	}
 
-	if u.Password != "" {
-		ep, _ := aes.AesEncrypt(u.Password, secretKey)
-		tx.Statement.SetColumn("Password", ep)
-	}
-
 	return nil
 }
 
-func (u *User) AfterFind(tx *gorm.DB) (err error) {
-	dp, err := aes.AesDecrypt(u.Password, secretKey)
-	if err == nil {
-		u.Password = dp
-	}
+func encryptUserPassword(password string) (string, error) {
+	return aes.AesEncrypt(password, secretKey)
+}
 
+func decryptUserPassword(password string) string {
+	// Older update paths could encrypt a password twice. Unwrap a small,
+	// bounded number of valid layers so affected accounts remain usable.
+	for range 3 {
+		decrypted, err := aes.AesDecrypt(password, secretKey)
+		if err != nil {
+			break
+		}
+		password = decrypted
+	}
+	return password
+}
+
+func (u *User) AfterFind(_ *gorm.DB) (err error) {
+	u.Password = decryptUserPassword(u.Password)
 	return
 }
 
@@ -79,7 +90,7 @@ func (u *User) All() []User {
 }
 
 func (u *User) Get(id string) User {
-	result := db.First(&u, id)
+	result := db.First(u, id)
 	if result.Error != nil {
 		logger.Error(context.Background(), result.Error.Error())
 		return User{}
@@ -96,13 +107,31 @@ func (u *User) Create() error {
 	if u.Username == adminUsername {
 		return fmt.Errorf("用户名与系统账户冲突")
 	}
+	if !isValidPassword(u.Password) {
+		return fmt.Errorf("%s", passwordPolicyMessage())
+	}
+	encryptedPassword, err := encryptUserPassword(u.Password)
+	if err != nil {
+		return fmt.Errorf("加密密码失败: %w", err)
+	}
+	u.Password = encryptedPassword
 
-	result := db.Create(&u)
+	result := db.Create(u)
 	return result.Error
 }
 
 func (u *User) Update() error {
-	result := db.Model(&u).Updates(&u)
+	if u.Password != "" && !isValidPassword(u.Password) {
+		return fmt.Errorf("%s", passwordPolicyMessage())
+	}
+	if u.Password != "" {
+		encryptedPassword, err := encryptUserPassword(u.Password)
+		if err != nil {
+			return fmt.Errorf("加密密码失败: %w", err)
+		}
+		u.Password = encryptedPassword
+	}
+	result := db.Model(u).Updates(u)
 	return result.Error
 }
 
@@ -112,7 +141,14 @@ func (u *User) Delete(id string) error {
 }
 
 func (u *User) UpdatePassword() error {
-	result := db.Model(&u).Updates(User{Password: u.Password})
+	if !isValidPassword(u.Password) {
+		return fmt.Errorf("%s", passwordPolicyMessage())
+	}
+	encryptedPassword, err := encryptUserPassword(u.Password)
+	if err != nil {
+		return fmt.Errorf("加密密码失败: %w", err)
+	}
+	result := db.Model(&User{}).Where("id = ?", u.ID).Update("password", encryptedPassword)
 	return result.Error
 }
 
@@ -164,7 +200,10 @@ func (u *User) Login(clogin bool) error {
 		}
 
 		if u.ExpireDate != "" {
-			ed, _ := time.Parse("2006-01-02", u.ExpireDate)
+			ed, err := parseExpireDate(u.ExpireDate)
+			if err != nil {
+				return fmt.Errorf("账号到期时间格式错误")
+			}
 			if ed.Before(time.Now()) {
 				return fmt.Errorf("账号已过期")
 			}
@@ -249,10 +288,25 @@ func (u *User) Login(clogin bool) error {
 			}
 		}
 
-		db.Model(&u).Update("last_login_at", time.Now())
+		db.Model(u).Update("last_login_at", time.Now())
 
 		return nil
 	}
+}
+
+func parseExpireDate(value string) (time.Time, error) {
+	formats := []string{
+		"2006-01-02/15:04:05",
+		"2006-01-02 15:04:05",
+		time.RFC3339,
+		"2006-01-02",
+	}
+	for _, format := range formats {
+		if parsed, err := time.ParseInLocation(format, value, time.Local); err == nil {
+			return parsed, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unsupported expiry date: %s", value)
 }
 
 func (u User) Info() User {

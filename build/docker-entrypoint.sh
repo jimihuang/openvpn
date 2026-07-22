@@ -27,14 +27,14 @@ EOF
 init_config() {
 	SERVER_NAME=$(jq -r '.system.base.server_name // ""' $SYSTEM_CONFIG)
 	OVPN_PORT=$(jq -r '.openvpn.ovpn_port // "1194"' $SYSTEM_CONFIG)
-	OVPN_PROTO=$(jq -r '.openvpn.ovpn_proto // "udp"' $SYSTEM_CONFIG)
+	OVPN_PROTO=$(jq -r '.openvpn.ovpn_proto // "tcp"' $SYSTEM_CONFIG)
 	OVPN_MAXCLIENTS=$(jq -r '.openvpn.ovpn_maxclients // "200"' $SYSTEM_CONFIG)
 	OVPN_MANAGEMENT=$(jq -r '.openvpn.ovpn_management // "127.0.0.1:7505"' $SYSTEM_CONFIG)
 	OVPN_IPV6=$(jq -r '.openvpn.ovpn_ipv6 // "false"' $SYSTEM_CONFIG)
 	OVPN_GATEWAY=$(jq -r '.openvpn.ovpn_gateway // "false"' $SYSTEM_CONFIG)
 	OVPN_SUBNET=$(jq -r '.openvpn.ovpn_subnet // "10.8.0.0/24"' $SYSTEM_CONFIG)
 	OVPN_SUBNET6=$(jq -r '.openvpn.ovpn_subnet6 // "fdaf:f178:e916:6dd0::/64"' $SYSTEM_CONFIG)
-	WEB_PORT=$(jq -r '.system.base.web_port // "8833"' $SYSTEM_CONFIG)
+	WEB_INTERNAL_PORT=$(jq -r '.system.base.web_internal_port // "8834"' $SYSTEM_CONFIG)
 
 	cat <<EOF >$OVPN_DATA/server.conf
 port $OVPN_PORT
@@ -72,9 +72,9 @@ management ${OVPN_MANAGEMENT/:/ }
 verb 2
 $([[ "$OVPN_PROTO" =~ "udp" ]] && echo "explicit-exit-notify 1")
 setenv ovpn_data ${OVPN_DATA:-/data}
-setenv auth_api http://127.0.0.1:$WEB_PORT/login
-setenv ovpn_auth_api http://127.0.0.1:$WEB_PORT/ovpn/login
-setenv ovpn_history_api http://127.0.0.1:$WEB_PORT/ovpn/history
+setenv auth_api http://127.0.0.1:$WEB_INTERNAL_PORT/login
+setenv ovpn_auth_api http://127.0.0.1:$WEB_INTERNAL_PORT/ovpn/login
+setenv ovpn_history_api http://127.0.0.1:$WEB_INTERNAL_PORT/ovpn/history
 EOF
 }
 
@@ -114,6 +114,14 @@ renew_cert() {
 	/usr/share/easy-rsa/easyrsa --batch --days=$1 renew-ca
 	/usr/share/easy-rsa/easyrsa --batch --days=$1 renew $SERVER_NAME
 	/usr/share/easy-rsa/easyrsa --batch revoke-renewed $SERVER_NAME
+
+	while IFS= read -r cert_path; do
+		client_name=$(basename "$cert_path" .crt)
+		[ "$client_name" = "$SERVER_NAME" ] && continue
+		/usr/share/easy-rsa/easyrsa --batch --days=$1 renew "$client_name"
+		/usr/share/easy-rsa/easyrsa --batch revoke-renewed "$client_name"
+	done < <(find "$EASYRSA_PKI/issued" -maxdepth 1 -type f -name '*.crt' -print)
+
 	/usr/share/easy-rsa/easyrsa --batch --days=$1 gen-crl
 }
 
@@ -148,7 +156,7 @@ getsubnet() {
 
 genclient() {
 	SERVER_NAME=$(jq -r '.system.base.server_name // ""' $SYSTEM_CONFIG)
-	OVPN_PROTO=$(jq -r '.openvpn.ovpn_proto // "udp"' $SYSTEM_CONFIG)
+	OVPN_PROTO=$(jq -r '.openvpn.ovpn_proto // "tcp"' $SYSTEM_CONFIG)
 	OVPN_PORT=$(jq -r '.openvpn.ovpn_port // "1194"' $SYSTEM_CONFIG)
 	OVPN_IPV6=$(jq -r '.openvpn.ovpn_ipv6 // "false"' $SYSTEM_CONFIG)
 
@@ -277,9 +285,9 @@ EOF
 
 set_firewall() {
 	set +e
-	WEB_PORT=$(jq -r '.system.base.web_port // "8833"' $ovpn_data/config.json)
+	WEB_INTERNAL_PORT=$(jq -r '.system.base.web_internal_port // "8834"' $ovpn_data/config.json)
 	TOKEN=$(jq -r '.system.base.token // ""' $ovpn_data/config.json)
-	ovpn_firewall_api="http://127.0.0.1:$WEB_PORT/ovpn/firewall?a=add_ovips"
+	ovpn_firewall_api="http://127.0.0.1:$WEB_INTERNAL_PORT/ovpn/firewall?a=add_ovips"
 	data="vip=$ifconfig_pool_remote_ip&vip6=$ifconfig_pool_remote_ip6&username=$username"
 	status=$(curl -w "%{http_code}" --connect-timeout 5 -s -X POST -o /dev/null -d $data $ovpn_firewall_api -H "O-Token: $TOKEN")
 	if [[ $? -ne 0 || $status -ne 200 ]]; then
@@ -290,9 +298,9 @@ set_firewall() {
 
 delete_firewall() {
 	set +e
-	WEB_PORT=$(jq -r '.system.base.web_port // "8833"' $ovpn_data/config.json)
+	WEB_INTERNAL_PORT=$(jq -r '.system.base.web_internal_port // "8834"' $ovpn_data/config.json)
 	TOKEN=$(jq -r '.system.base.token // ""' $ovpn_data/config.json)
-	ovpn_firewall_api="http://127.0.0.1:$WEB_PORT/ovpn/firewall?a=delete_ovips"
+	ovpn_firewall_api="http://127.0.0.1:$WEB_INTERNAL_PORT/ovpn/firewall?a=delete_ovips"
 	data="vip=$ifconfig_pool_remote_ip&vip6=$ifconfig_pool_remote_ip6&username=$username"
 	status=$(curl -w "%{http_code}" --connect-timeout 5 -s -X POST -o /dev/null -d $data $ovpn_firewall_api -H "O-Token: $TOKEN")
 	if [[ $? -ne 0 || $status -ne 200 ]]; then

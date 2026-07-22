@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"crypto/x509"
 	"embed"
 	"encoding/csv"
@@ -11,7 +12,6 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"io/fs"
 	"log"
 	"math/rand"
 	"net"
@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gavintan/gopkg/aes"
 	"github.com/gavintan/gopkg/tools"
@@ -66,10 +67,11 @@ type ServerData struct {
 }
 
 type ClientConfigData struct {
-	Name     string `json:"name"`
-	FullName string `json:"fullName"`
-	File     string `json:"file"`
-	Date     string `json:"date"`
+	Name      string `json:"name"`
+	FullName  string `json:"fullName"`
+	File      string `json:"file"`
+	Date      string `json:"date"`
+	IsDefault bool   `json:"isDefault"`
 }
 
 type Params struct {
@@ -389,10 +391,14 @@ func getCerts(ovData string) []CertData {
 }
 
 func isValidPassword(pw string) bool {
+	if !viper.GetBool("system.base.enforce_password_policy") {
+		return utf8.RuneCountInString(pw) >= 6
+	}
+
 	lower := regexp.MustCompile(`[a-z]`)
 	upper := regexp.MustCompile(`[A-Z]`)
 	digit := regexp.MustCompile(`[0-9]`)
-	special := regexp.MustCompile(`[!@#\$%\^&\*()_+\-=\[\]{};':"\\|,.<>\/?]`)
+	special := regexp.MustCompile(`[^A-Za-z0-9]`)
 
 	count := 0
 	if len(pw) >= 12 {
@@ -412,6 +418,64 @@ func isValidPassword(pw string) bool {
 	}
 
 	return count == 5
+}
+
+func passwordPolicyMessage() string {
+	if viper.GetBool("system.base.enforce_password_policy") {
+		return "密码不满足要求（长度至少12位，包含大小写字母、数字、特殊字符）"
+	}
+	return "密码不满足要求（长度至少6位）"
+}
+
+func listClientConfigs(clientsDir string) ([]ClientConfigData, error) {
+	clients := make([]ClientConfigData, 0)
+	files, err := os.ReadDir(clientsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return clients, nil
+		}
+		return nil, err
+	}
+
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".ovpn") {
+			continue
+		}
+		finfo, err := file.Info()
+		if err != nil {
+			return nil, err
+		}
+		clients = append(clients, ClientConfigData{
+			Name:     strings.TrimSuffix(file.Name(), ".ovpn"),
+			FullName: file.Name(),
+			File:     fmt.Sprintf("/ovpn/download/%s", file.Name()),
+			Date:     finfo.ModTime().Local().Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	sort.Slice(clients, func(i, j int) bool {
+		if clients[i].Date == clients[j].Date {
+			return clients[i].FullName < clients[j].FullName
+		}
+		return clients[i].Date < clients[j].Date
+	})
+
+	defaultConfig := viper.GetString("system.base.default_ovpn_config")
+	defaultIndex := -1
+	for i := range clients {
+		if clients[i].FullName == defaultConfig {
+			defaultIndex = i
+			break
+		}
+	}
+	if defaultIndex == -1 && len(clients) > 0 {
+		defaultIndex = 0
+	}
+	if defaultIndex >= 0 {
+		clients[defaultIndex].IsDefault = true
+	}
+
+	return clients, nil
 }
 
 func genRandomString(length int) string {
@@ -452,14 +516,18 @@ func AuthMiddleWare() gin.HandlerFunc {
 		}
 
 		if user == nil {
-			c.Redirect(302, "/login")
+			if isAPIRequest(c.Request.URL.Path) {
+				c.JSON(http.StatusUnauthorized, gin.H{"message": "登录已过期，请重新登录"})
+			} else {
+				c.Redirect(http.StatusFound, "/login")
+			}
 			c.Abort()
 			return
 		}
 
 		if user, ok := user.(string); ok {
-			if c.Request.URL.Path != "/" && !strings.HasPrefix(c.Request.URL.Path, "/client") && user != adminUsername {
-				c.Redirect(302, "/")
+			if isAPIRequest(c.Request.URL.Path) && !strings.HasPrefix(c.Request.URL.Path, "/client") && c.Request.URL.Path != "/session" && user != adminUsername {
+				c.JSON(http.StatusForbidden, gin.H{"message": "没有管理员权限"})
 				c.Abort()
 				return
 			}
@@ -469,7 +537,15 @@ func AuthMiddleWare() gin.HandlerFunc {
 	}
 }
 
+func isAPIRequest(path string) bool {
+	return path == "/session" || path == "/settings" || strings.HasPrefix(path, "/ovpn/") ||
+		strings.HasPrefix(path, "/client/") || strings.HasPrefix(path, "/email/") || strings.HasPrefix(path, "/user/")
+}
+
 func init() {
+	if strings.HasSuffix(os.Args[0], ".test") {
+		return
+	}
 	initConfig()
 	loadConfig()
 }
@@ -531,13 +607,8 @@ func main() {
 
 	// r.Use(gin.Recovery())
 
-	templ := template.Must(template.New("").ParseFS(FS, "templates/*.html"))
-	r.SetHTMLTemplate(templ)
-	f, _ := fs.Sub(FS, "templates/static")
-	r.StaticFS("/static", http.FS(f))
-
 	r.GET("/login", func(c *gin.Context) {
-		c.HTML(http.StatusOK, "login.html", gin.H{})
+		serveSPAIndex(c)
 	})
 
 	r.POST("/login", func(c *gin.Context) {
@@ -567,11 +638,17 @@ func main() {
 		if remember7d == "on" {
 			session.Options(sessions.Options{
 				HttpOnly: true,
+				Secure:   c.Request.TLS != nil,
+				SameSite: http.SameSiteLaxMode,
+				Path:     "/",
 				MaxAge:   3600 * 24 * 7,
 			})
 		} else {
 			session.Options(sessions.Options{
 				HttpOnly: true,
+				Secure:   c.Request.TLS != nil,
+				SameSite: http.SameSiteLaxMode,
+				Path:     "/",
 				MaxAge:   3600 * 1,
 			})
 		}
@@ -663,24 +740,23 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"key": key, "master": mBase64, "thumb": tBase64})
 	})
 
+	// 新版 SPA 静态资源与前端路由回退,必须在 AuthMiddleWare 之前注册
+	registerWebUI(r)
+
 	r.Use(AuthMiddleWare())
 
-	r.GET("/", func(c *gin.Context) {
+	r.GET("/session", func(c *gin.Context) {
 		session := sessions.Default(c)
-		if user, ok := session.Get("user").(string); ok {
-			if user == adminUsername {
-				c.Redirect(302, "/admin")
-				return
-			}
-
-			u := User{Username: user}.Info()
-			if *u.IsFirstLogin {
-				c.Redirect(302, "/login")
-				return
-			}
+		username, _ := session.Get("user").(string)
+		role := "user"
+		if username == adminUsername {
+			role = "admin"
 		}
+		c.JSON(http.StatusOK, gin.H{"username": username, "role": role})
+	})
 
-		c.HTML(http.StatusOK, "client.html", conf.Client)
+	r.GET("/", func(c *gin.Context) {
+		serveSPAIndex(c)
 	})
 
 	r.GET("/admin", func(c *gin.Context) {
@@ -692,24 +768,55 @@ func main() {
 			}
 		}
 
-		c.HTML(http.StatusOK, "index.html", gin.H{
-			"server":   ov.getServer(),
-			"sysUser":  adminUsername,
-			"ldapAuth": ldapAuth,
-			"version":  "v" + version,
-		})
+		serveSPAIndex(c)
 	})
 
 	r.GET("/settings", func(c *gin.Context) {
 		var conf config
 		viper.Unmarshal(&conf)
+		tlsStatus := getTLSCertificateStatus()
+		conf.System.Base.HTTPSCertConfigured = tlsStatus.Configured
+		conf.System.Base.HTTPSCertSubject = tlsStatus.Subject
+		if !tlsStatus.NotAfter.IsZero() {
+			conf.System.Base.HTTPSCertNotAfter = tlsStatus.NotAfter.Format(time.RFC3339)
+		}
 
 		c.JSON(http.StatusOK, conf)
 	})
 
 	r.POST("/settings", func(c *gin.Context) {
-		c.Request.ParseForm()
+		if err := c.Request.ParseForm(); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"message": "解析设置失败"})
+			return
+		}
+
+		httpsEnabled := viper.GetBool("system.base.https_enabled")
+		if values, ok := c.Request.PostForm["system.base.https_enabled"]; ok && len(values) > 0 {
+			httpsEnabled = values[0] == "true"
+		}
+		certPEM := strings.TrimSpace(c.PostForm("https_certificate"))
+		keyPEM := strings.TrimSpace(c.PostForm("https_private_key"))
+		if (certPEM == "") != (keyPEM == "") {
+			c.JSON(http.StatusBadRequest, gin.H{"message": "HTTPS 证书链和私钥必须同时填写"})
+			return
+		}
+		tlsMaterialChanged := certPEM != "" && keyPEM != ""
+		if tlsMaterialChanged {
+			if err := writeTLSMaterial([]byte(certPEM+"\n"), []byte(keyPEM+"\n")); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+				return
+			}
+		}
+		if httpsEnabled && !getTLSCertificateStatus().Configured {
+			c.JSON(http.StatusBadRequest, gin.H{"message": "启用 HTTPS 前必须填写有效且匹配的证书链和私钥"})
+			return
+		}
+
+		previousHTTPSEnabled := viper.GetBool("system.base.https_enabled")
 		for k, vs := range c.Request.PostForm {
+			if k == "https_certificate" || k == "https_private_key" {
+				continue
+			}
 			val := vs[0]
 
 			switch k {
@@ -766,8 +873,18 @@ func main() {
 			c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 			return
 		}
+		if httpsEnabled && (tlsMaterialChanged || httpsEnabled != previousHTTPSEnabled) {
+			if err := updateInternalAPIEndpoints(); err != nil {
+				logger.Error(context.Background(), "failed to update internal API endpoints: %s", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "HTTPS 设置已保存，但更新 OpenVPN 内部认证地址失败: " + err.Error()})
+				return
+			}
+		}
 
-		c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
+		c.JSON(http.StatusOK, gin.H{
+			"message":         "更新成功",
+			"restartRequired": tlsMaterialChanged || httpsEnabled != previousHTTPSEnabled,
+		})
 	})
 
 	r.POST("/email/send", func(c *gin.Context) {
@@ -785,7 +902,16 @@ func main() {
 
 	ovpn := r.Group("/ovpn")
 	{
-		ovpn.StaticFS("/download", http.Dir(filepath.Join(ovData, "clients")))
+		// 使用 FileAttachment 强制触发浏览器下载(StaticFS 会被浏览器当文本打开)
+		ovpn.GET("/download/:file", func(c *gin.Context) {
+			file := filepath.Base(c.Param("file"))
+			p := filepath.Join(ovData, "clients", file)
+			if _, err := os.Stat(p); err != nil {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			c.FileAttachment(p, file)
+		})
 
 		ovpn.POST("/server", func(c *gin.Context) {
 			a := c.PostForm("action")
@@ -825,6 +951,12 @@ func main() {
 					return
 				}
 
+				if err := syncInlinePKIFromDisk(); err != nil {
+					logger.Error(context.Background(), err.Error())
+					c.JSON(http.StatusInternalServerError, gin.H{"message": "证书已续期，但同步客户端 CA 失败: " + err.Error()})
+					return
+				}
+
 				ov.sendCommand("signal SIGHUP")
 				c.JSON(http.StatusOK, gin.H{"message": "更新证书成功"})
 			case "restartSrv":
@@ -847,23 +979,26 @@ func main() {
 				c.JSON(http.StatusOK, gin.H{"content": string(data)})
 			case "updateConfig":
 				content := c.PostForm("content")
-
-				file, err := os.OpenFile(filepath.Join(ovData, "server.conf"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-				if err != nil {
-					logger.Error(context.Background(), err.Error())
-					c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+				if strings.TrimSpace(content) == "" {
+					c.JSON(http.StatusBadRequest, gin.H{"message": "server.conf 不能为空"})
 					return
 				}
-				defer file.Close()
+				if len(content) > 2*1024*1024 || strings.ContainsRune(content, '\x00') {
+					c.JSON(http.StatusBadRequest, gin.H{"message": "server.conf 内容非法或超过 2 MiB"})
+					return
+				}
+				if !strings.HasSuffix(content, "\n") {
+					content += "\n"
+				}
 
-				_, err = file.WriteString(content)
-				if err != nil {
+				configPath := filepath.Join(ovData, "server.conf")
+				if err := applyFileUpdates([]fileUpdate{{path: configPath, data: []byte(content), mode: 0644}}); err != nil {
 					logger.Error(context.Background(), err.Error())
-					c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+					c.JSON(http.StatusInternalServerError, gin.H{"message": "保存 server.conf 失败: " + err.Error()})
 					return
 				}
 
-				c.JSON(http.StatusOK, gin.H{"message": "配置更新成功"})
+				c.JSON(http.StatusOK, gin.H{"message": "配置已保存并创建备份，请重启 OpenVPN 生效"})
 			default:
 				c.JSON(http.StatusUnprocessableEntity, gin.H{"message": "未知操作"})
 			}
@@ -995,8 +1130,8 @@ func main() {
 			defer writer.Flush()
 
 			writer.Write([]string{"username", "password", "name", "email", "is_enable", "expire_date", "ip_addr", "ovpn_config"})
-			writer.Write([]string{"zhangsan", "123456", "张三", "zhangsan@example.com", "1", "2025-12-01/00:00:00", "10.8.0.222", "tt-gz.ovpn"})
-			writer.Write([]string{"lisi", "123456", "李四", "lisi@example.com", "0", "", "", "tt-sh.ovpn"})
+			writer.Write([]string{"zhangsan", "Vpn@2026Secure", "张三", "zhangsan@example.com", "1", "2027-12-01/00:00:00", "10.8.0.222", "tt-gz.ovpn"})
+			writer.Write([]string{"lisi", "Vpn@2026Secure", "李四", "lisi@example.com", "0", "", "", "tt-sh.ovpn"})
 		})
 
 		ovpn.GET("/user/export", func(c *gin.Context) {
@@ -1258,27 +1393,32 @@ func main() {
 		})
 
 		ovpn.GET("/client", func(c *gin.Context) {
-			clients := make([]ClientConfigData, 0)
+			clients, err := listClientConfigs(filepath.Join(ovData, "clients"))
+			if err != nil {
+				logger.Error(context.Background(), err.Error())
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "读取客户端配置失败"})
+				return
+			}
+			c.JSON(http.StatusOK, clients)
+		})
 
-			files, _ := os.ReadDir(filepath.Join(ovData, "clients"))
-			for _, file := range files {
-				finfo, _ := file.Info()
-
-				f := ClientConfigData{
-					Name:     strings.TrimSuffix(file.Name(), filepath.Ext(file.Name())),
-					FullName: file.Name(),
-					File:     fmt.Sprintf("/ovpn/download/%s", file.Name()),
-					Date:     finfo.ModTime().Local().Format("2006-01-02 15:04:05"),
-				}
-				clients = append(clients, f)
+		ovpn.PUT("/client/:name/default", func(c *gin.Context) {
+			name := c.Param("name")
+			if filepath.Base(name) != name || !strings.HasSuffix(name, ".ovpn") {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "非法客户端配置名称"})
+				return
+			}
+			if _, err := os.Stat(filepath.Join(ovData, "clients", name)); err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"message": "客户端配置不存在"})
+				return
 			}
 
-			sort.Slice(clients, func(i, j int) bool {
-				return clients[i].Date < clients[j].Date
-			})
-
-			c.JSON(http.StatusOK, clients)
-
+			viper.Set("system.base.default_ovpn_config", name)
+			if err := viper.WriteConfig(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"message": "默认客户端设置成功"})
 		})
 
 		ovpn.GET("/client/:name/ccd", func(c *gin.Context) {
@@ -1423,6 +1563,22 @@ func main() {
 						c.JSON(http.StatusInternalServerError, gin.H{"message": "客户端添加失败"})
 						return
 					}
+					if viper.GetString("system.base.default_ovpn_config") == "" {
+						clients, listErr := listClientConfigs(clientsDir)
+						if listErr == nil && len(clients) > 0 {
+							for _, client := range clients {
+								if client.IsDefault {
+									viper.Set("system.base.default_ovpn_config", client.FullName)
+									break
+								}
+							}
+							if err := viper.WriteConfig(); err != nil {
+								logger.Error(context.Background(), err.Error())
+							}
+						} else if listErr != nil {
+							logger.Error(context.Background(), listErr.Error())
+						}
+					}
 
 					c.JSON(http.StatusOK, gin.H{"message": "客户端添加成功"})
 					return
@@ -1466,6 +1622,12 @@ func main() {
 
 			dataRoot.Remove(filepath.Join("clients", fmt.Sprintf("%s.ovpn", name)))
 			dataRoot.Remove(filepath.Join("ccd", name))
+			if viper.GetString("system.base.default_ovpn_config") == name+".ovpn" {
+				viper.Set("system.base.default_ovpn_config", "")
+				if err := viper.WriteConfig(); err != nil {
+					logger.Error(context.Background(), err.Error())
+				}
+			}
 
 			c.JSON(http.StatusOK, gin.H{"message": "删除客户端成功"})
 		})
@@ -1557,10 +1719,25 @@ func main() {
 		ovpn.GET("/certs", func(c *gin.Context) {
 			c.JSON(http.StatusOK, getCerts(ovData))
 		})
+
+		ovpn.GET("/certs/material", getCertificateMaterial)
+		ovpn.PUT("/certs/material", replaceCertificateMaterial)
 	}
 
 	client := r.Group("/client")
 	{
+		client.GET("/password-policy", func(c *gin.Context) {
+			enforced := viper.GetBool("system.base.enforce_password_policy")
+			minLength := 6
+			if enforced {
+				minLength = 12
+			}
+			c.JSON(http.StatusOK, gin.H{
+				"enforced":  enforced,
+				"minLength": minLength,
+			})
+		})
+
 		client.GET("/userinfo", func(c *gin.Context) {
 			var u User
 
@@ -1603,7 +1780,7 @@ func main() {
 			}
 
 			if !isValidPassword(u.Password) {
-				c.JSON(http.StatusInternalServerError, gin.H{"message": "密码不满足要求（长度12位，包含大小写字母、数字、特殊字符）"})
+				c.JSON(http.StatusBadRequest, gin.H{"message": passwordPolicyMessage()})
 				return
 			}
 
@@ -1614,9 +1791,15 @@ func main() {
 				}
 			}
 
-			err := db.Transaction(func(tx *gorm.DB) error {
+			encryptedPassword, err := encryptUserPassword(u.Password)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "加密密码失败"})
+				return
+			}
+
+			err = db.Transaction(func(tx *gorm.DB) error {
 				data := User{
-					Password: u.Password,
+					Password: encryptedPassword,
 				}
 
 				if isFirstLogin, ok := c.Request.PostForm["isFirstLogin"]; ok {
@@ -1624,7 +1807,7 @@ func main() {
 					data.IsFirstLogin = &val
 				}
 
-				if err := tx.Model(&u).Updates(data).Error; err != nil {
+				if err := tx.Model(&User{}).Where("id = ?", u.ID).Updates(data).Error; err != nil {
 					return err
 				}
 
@@ -1735,12 +1918,12 @@ func main() {
 
 			u = u.Info()
 			if u.MfaSecret == "" {
-				secret, err := GenMfa(u.Username)
+				secret, uri, qrCode, err := GenMfa(u.Username)
 				if err != nil {
 					c.JSON(http.StatusInternalServerError, gin.H{"message": fmt.Errorf("MFA: %w", err).Error()})
 				} else {
 					u.MfaSecret = secret
-					c.JSON(http.StatusOK, gin.H{"mfaEnable": false, "user": u})
+					c.JSON(http.StatusOK, gin.H{"mfaEnable": false, "user": u, "otpauthUri": uri, "qrCode": qrCode})
 				}
 			} else {
 				c.JSON(http.StatusOK, gin.H{"mfaEnable": true, "user": u})
@@ -1790,5 +1973,47 @@ func main() {
 		})
 	}
 
-	r.Run(fmt.Sprintf(":%s", webPort))
+	if webPort == webInternalPort {
+		log.Fatalf("public web port and internal web port must be different: %s", webPort)
+	}
+
+	internalServer := newWebServer("127.0.0.1:"+webInternalPort, r)
+	go func() {
+		logger.Info(context.Background(), "internal HTTP API listening on 127.0.0.1:%s", webInternalPort)
+		if err := internalServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("internal HTTP API failed: %v", err)
+		}
+	}()
+
+	publicServer := newWebServer(":"+webPort, r)
+	var serveErr error
+	if conf.System.Base.HTTPSEnabled {
+		certPath, keyPath := tlsMaterialPaths()
+		if !getTLSCertificateStatus().Configured {
+			log.Fatal("HTTPS is enabled but the certificate or private key is missing, invalid, expired, or mismatched")
+		}
+		logger.Info(context.Background(), "public HTTPS server listening on :%s", webPort)
+		serveErr = publicServer.ListenAndServeTLS(certPath, keyPath)
+	} else {
+		logger.Info(context.Background(), "public HTTP server listening on :%s", webPort)
+		serveErr = publicServer.ListenAndServe()
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		log.Fatal(serveErr)
+	}
+}
+
+func newWebServer(address string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	}
 }

@@ -1,5 +1,7 @@
 # openvpn
 
+Deployment, native HTTPS, certificate handling, upgrades, and recovery are documented in [Deployment and HTTPS](docs/deployment-and-https.md).
+
 ![image-20240529110841439](https://raw.githubusercontent.com/GavinTan/files/master/picgo/image-20240529110841439.png)
 
 ![20220930173030](https://raw.githubusercontent.com/GavinTan/files/master/picgo/20220930173030.png)
@@ -53,7 +55,7 @@
 ```shell
 docker run -d \
   --cap-add=NET_ADMIN \
-  -p 1194:1194/udp \
+  -p 1194:1194/tcp \
   -p 8833:8833 \
   -v $(pwd)/data:/data \
   yyxx/openvpn
@@ -76,7 +78,7 @@ docker run -d \
       cap_add:
         - NET_ADMIN
       ports:
-        - "1194:1194/udp"
+        - "1194:1194/tcp"
         - "8833:8833"
       volumes:
         - ./data:/data

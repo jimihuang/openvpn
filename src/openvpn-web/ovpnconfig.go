@@ -156,6 +156,11 @@ func (cfg *VPNConfig) Update(key string, val string) {
 		cfg.Set("port", val)
 	case "openvpn.ovpn_proto":
 		cfg.Set("proto", val)
+		if strings.Contains(strings.ToLower(val), "udp") {
+			cfg.Set("explicit-exit-notify", "1")
+		} else {
+			cfg.Delete("explicit-exit-notify")
+		}
 	case "openvpn.ovpn_max_clients":
 		cfg.Set("max-clients", val)
 	case "openvpn.ovpn_subnet":

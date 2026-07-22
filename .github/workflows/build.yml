@@ -18,6 +18,23 @@ jobs:
         with:
           go-version-file: 'src/openvpn-web/go.mod'
 
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Build Web UI
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          rm -rf ../src/openvpn-web/webdist
+          mkdir -p ../src/openvpn-web/webdist
+          cp -R dist/. ../src/openvpn-web/webdist/
+
+      - name: Build container binaries
+        working-directory: src/openvpn-web
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../../build/openvpn-web-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o ../../build/openvpn-web-linux-arm64 .
+
       - name: Build openvpn-web
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -51,8 +68,6 @@ jobs:
           platforms: |
             linux/amd64
             linux/arm64
-            linux/arm/v6
-            linux/arm/v7
 
           build-args: |
             VERSION=${{ env.VERSION }}

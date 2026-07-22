@@ -6,5 +6,9 @@ bin
 ovpn.db
 /src/openvpn-web/openvpn-web
 /src/openvpn-web/openvpn-web.exe
+/src/openvpn-web/webdist
+/web/node_modules
+/web/*.tsbuildinfo
+/build/openvpn-web-*
+/deploy/vpntest/
 config.json
-

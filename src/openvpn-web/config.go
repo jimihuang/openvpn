@@ -11,14 +11,21 @@ import (
 )
 
 type SysBeseConfig struct {
-	SiteUrl              string `json:"site_url" mapstructure:"site_url"`
-	WebPort              string `json:"web_port" mapstructure:"web_port"`
-	AdminUsername        string `json:"admin_username" mapstructure:"admin_username"`
-	AdminPassword        string `json:"admin_password" mapstructure:"admin_password"`
-	AutoUpdateOvpnConfig bool   `json:"auto_update_ovpn_config" mapstructure:"auto_update_ovpn_config"`
-	MaxDuplicateLogin    int    `json:"max_duplicate_login" mapstructure:"max_duplicate_login"`
-	HistoryMaxDays       int    `json:"history_max_days" mapstructure:"history_max_days"`
-	ValidateClientConfig bool   `json:"validate_client_config" mapstructure:"validate_client_config"`
+	SiteUrl               string `json:"site_url" mapstructure:"site_url"`
+	WebPort               string `json:"web_port" mapstructure:"web_port"`
+	WebInternalPort       string `json:"-" mapstructure:"web_internal_port"`
+	HTTPSEnabled          bool   `json:"https_enabled" mapstructure:"https_enabled"`
+	HTTPSCertConfigured   bool   `json:"https_certificate_configured" mapstructure:"-"`
+	HTTPSCertSubject      string `json:"https_certificate_subject,omitempty" mapstructure:"-"`
+	HTTPSCertNotAfter     string `json:"https_certificate_not_after,omitempty" mapstructure:"-"`
+	AdminUsername         string `json:"admin_username" mapstructure:"admin_username"`
+	AdminPassword         string `json:"admin_password" mapstructure:"admin_password"`
+	AutoUpdateOvpnConfig  bool   `json:"auto_update_ovpn_config" mapstructure:"auto_update_ovpn_config"`
+	MaxDuplicateLogin     int    `json:"max_duplicate_login" mapstructure:"max_duplicate_login"`
+	HistoryMaxDays        int    `json:"history_max_days" mapstructure:"history_max_days"`
+	ValidateClientConfig  bool   `json:"validate_client_config" mapstructure:"validate_client_config"`
+	EnforcePasswordPolicy bool   `json:"enforce_password_policy" mapstructure:"enforce_password_policy"`
+	DefaultOvpnConfig     string `json:"default_ovpn_config" mapstructure:"default_ovpn_config"`
 }
 
 type SysLdapConfig struct {
@@ -79,6 +86,7 @@ type config struct {
 
 var (
 	webPort                string
+	webInternalPort        string
 	secretKey              string
 	adminUsername          string
 	adminPassword          string
@@ -103,6 +111,8 @@ func initConfig() {
 
 	viper.SetDefault("system.base.site_url", "http://127.0.0.1:8833")
 	viper.SetDefault("system.base.web_port", "8833")
+	viper.SetDefault("system.base.web_internal_port", "8834")
+	viper.SetDefault("system.base.https_enabled", false)
 	viper.SetDefault("system.base.secret_key", sk)
 	viper.SetDefault("system.base.server_cn", "ovpn_"+genRandomString(16))
 	viper.SetDefault("system.base.server_name", "server_"+genRandomString(16))
@@ -111,6 +121,8 @@ func initConfig() {
 	viper.SetDefault("system.base.auto_update_ovpn_config", false)
 	viper.SetDefault("system.base.max_duplicate_login", 0)
 	viper.SetDefault("system.base.validate_client_config", false)
+	viper.SetDefault("system.base.enforce_password_policy", true)
+	viper.SetDefault("system.base.default_ovpn_config", "")
 	viper.SetDefault("system.base.history_max_days", 90)
 	viper.SetDefault("system.base.nft_table_name", "openvpn-nft")
 	viper.SetDefault("system.ldap.ldap_auth", false)
@@ -138,7 +150,7 @@ func initConfig() {
 	viper.SetDefault("client.client_url.ios", "https://itunes.apple.com/us/app/openvpn-connect/id590379981?mt=8")
 
 	viper.SetDefault("openvpn.ovpn_port", 1194)
-	viper.SetDefault("openvpn.ovpn_proto", "udp")
+	viper.SetDefault("openvpn.ovpn_proto", "tcp")
 	viper.SetDefault("openvpn.ovpn_subnet", "10.8.0.0/24")
 	viper.SetDefault("openvpn.ovpn_max_clients", 200)
 	viper.SetDefault("openvpn.ovpn_gateway", false)
@@ -196,11 +208,25 @@ func upadteOvpnConfig() {
 			cfg.Update("openvpn."+k, fmt.Sprintf("%v", v))
 		}
 
-		cfg.Set("setenv auth_api", fmt.Sprintf("http://127.0.0.1:%s/login", webPort))
-		cfg.Set("setenv ovpn_auth_api", fmt.Sprintf("http://127.0.0.1:%s/ovpn/login", webPort))
-		cfg.Set("setenv ovpn_history_api", fmt.Sprintf("http://127.0.0.1:%s/ovpn/history", webPort))
+		setInternalAPIEndpoints(cfg)
 		cfg.Save()
 	}
+}
+
+func setInternalAPIEndpoints(cfg *VPNConfig) {
+	cfg.Set("setenv auth_api", fmt.Sprintf("http://127.0.0.1:%s/login", webInternalPort))
+	cfg.Set("setenv ovpn_auth_api", fmt.Sprintf("http://127.0.0.1:%s/ovpn/login", webInternalPort))
+	cfg.Set("setenv ovpn_history_api", fmt.Sprintf("http://127.0.0.1:%s/ovpn/history", webInternalPort))
+}
+
+func updateInternalAPIEndpoints() error {
+	cfg, err := initOvpnConfig()
+	if err != nil {
+		return err
+	}
+	setInternalAPIEndpoints(cfg)
+	cfg.Save()
+	return nil
 }
 
 func loadConfig() {
@@ -210,6 +236,7 @@ func loadConfig() {
 	viper.Unmarshal(&conf)
 
 	webPort = conf.System.Base.WebPort
+	webInternalPort = conf.System.Base.WebInternalPort
 	adminUsername = conf.System.Base.AdminUsername
 	adminPassword = conf.System.Base.AdminPassword
 	ldapAuth = conf.System.Ldap.LdapAuth

@@ -3,6 +3,7 @@ module openvpn-web
 go 1.25.4
 
 require (
+	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gavintan/gopkg v1.0.1
 	github.com/gin-contrib/sessions v1.0.4
@@ -18,14 +19,13 @@ require (
 	github.com/wenlng/go-captcha-assets v1.0.7
 	github.com/wenlng/go-captcha/v2 v2.0.5
 	github.com/wneessen/go-mail v0.7.2
-	golang.org/x/crypto v0.41.0
+	golang.org/x/crypto v0.53.0
 	gorm.io/gorm v1.31.1
 )
 
 require (
 	github.com/Azure/go-ntlmssp v0.0.0-20221128193559-754e69321358 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
-	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc // indirect
 	github.com/bytedance/sonic v1.14.0 // indirect
 	github.com/bytedance/sonic/loader v0.3.0 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
@@ -70,12 +70,12 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/arch v0.20.0 // indirect
 	golang.org/x/image v0.16.0 // indirect
-	golang.org/x/mod v0.27.0 // indirect
-	golang.org/x/net v0.43.0 // indirect
-	golang.org/x/sync v0.17.0 // indirect
-	golang.org/x/sys v0.35.0 // indirect
-	golang.org/x/text v0.29.0 // indirect
-	golang.org/x/tools v0.36.0 // indirect
+	golang.org/x/mod v0.37.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/tools v0.47.0 // indirect
 	google.golang.org/protobuf v1.36.9 // indirect
 	modernc.org/libc v1.22.5 // indirect
 	modernc.org/mathutil v1.5.0 // indirect

@@ -4,7 +4,7 @@ services:
     cap_add:
       - NET_ADMIN
     ports:
-      - "1194:1194/udp"
+      - "1194:1194/tcp"
       - "8833:8833"
     environment:
       - ADMIN_USERNAME=admin
