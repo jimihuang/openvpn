@@ -2,6 +2,8 @@
 
 Deployment, native HTTPS, certificate handling, upgrades, and recovery are documented in [Deployment and HTTPS](docs/deployment-and-https.md).
 
+部署形态选型与已知代码问题见 [两种部署形态与已知问题](docs/deployment-shapes-and-known-issues.md)。
+
 ![image-20240529110841439](https://raw.githubusercontent.com/GavinTan/files/master/picgo/image-20240529110841439.png)
 
 ![20220930173030](https://raw.githubusercontent.com/GavinTan/files/master/picgo/20220930173030.png)
